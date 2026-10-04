@@ -12,6 +12,7 @@ Run: python3 -m tanggol.siem [port]   (default 127.0.0.1:8789)
 
 from __future__ import annotations
 
+import html as _htm
 import json
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -168,6 +169,16 @@ function addArc(from, to) {
 let count = 0;
 async function poll() {
   try {
+    if (window.__PRESEED__) {
+      // ?shot=1: seed arcs instantly so a static capture catches a live-looking globe
+      const st0 = await (await fetch('/api/stats')).json();
+      for (let i = 0; i < Math.min(st0.total, 12); i++) addArc(randomSrc(), home);
+      count = st0.total;
+      document.getElementById('count').textContent = count;
+      window.__PRESEED__ = 0;
+      window.__SHOT_DONE__ = 1;  // stop the rAF loop: settle for headless capture
+      return;
+    }
     const st = await (await fetch('/api/stats')).json();
     const target = st.total - count;
     if (target > 0) {
@@ -180,7 +191,7 @@ async function poll() {
 poll(); setInterval(poll, 3000);
 
 (function animate() {
-  requestAnimationFrame(animate);
+  if (!window.__SHOT_DONE__) requestAnimationFrame(animate);
   controls.update();
   wire.rotation.y += 0.0006;
   renderer.render(scene, camera);
@@ -206,8 +217,39 @@ class Api(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _html(self, page):
-        body = page.replace("__VER__", __version__).encode()
+    def _prerender_dash(self, body: str) -> str:
+        """Inject stats + rows server-side (?shot=1) so static captures render populated."""
+        st = self.store.stats()
+        ev = self.store.recent(limit=40)
+        esc = _htm.escape
+        stats = (
+            '<div class="stat"><div class="n">%d</div><div class="l">total events</div></div>'
+            '<div class="stat%s"><div class="n">%d</div><div class="l">alerts</div></div>%s'
+            % (st["total"], " alert" if st["alerts"] else "", st["alerts"],
+               "".join('<div class="stat"><div class="n">%d</div><div class="l">%s</div></div>'
+                       % (s["count"], esc(s["src"])) for s in st["top_sources"][:2]))
+        )
+        rows = "".join(
+            '<tr class="%s"><td class="muted">%s</td>'
+            '<td><span class="tag%s">%s</span></td>'
+            '<td>%s</td><td>%s</td><td>%s</td></tr>'
+            % ("alert-row" if e["alert"] else "", esc(e["ts"]),
+               " alert" if e["alert"] else "", esc(e["kind"]),
+               esc(e["src"]), "" if e["dst_port"] is None else e["dst_port"], esc(e["detail"]))
+            for e in ev
+        )
+        body = body.replace('<div class="stats" id="stats"></div>',
+                            '<div class="stats" id="stats">%s</div>' % stats)
+        body = body.replace('<tbody id="events"></tbody>', '<tbody id="events">%s</tbody>' % rows)
+        return body
+
+    def _html(self, page, shot: bool = False, preseed: bool = False):
+        body = page.replace("__VER__", __version__)
+        if shot and preseed:
+            body = body.replace("</head>", "<script>window.__PRESEED__=1</script></head>")
+        if shot:
+            body = self._prerender_dash(body)
+        body = body.encode()
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
@@ -217,10 +259,11 @@ class Api(BaseHTTPRequestHandler):
     def do_GET(self):
         p = urlparse(self.path).path
         q = urlparse(self.path).query
+        shot = "shot=1" in q
         if p == "/" or p == "/siem":
-            self._html(_DASH)
+            self._html(_DASH, shot=shot, preseed=False)
         elif p == "/globe":
-            self._html(_GLOBE)
+            self._html(_GLOBE, shot=shot, preseed=True)
         elif p == "/api/events":
             limit = 100
             for part in q.split("&"):
